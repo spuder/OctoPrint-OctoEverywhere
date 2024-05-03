@@ -256,8 +256,6 @@ class QuickCam:
                             # This can return None, which means we should just check the time and spin.
                             img = camImpl.GetImage()
 
-                            self.Logger.debug("got image "+str(len(img)))
-
                             # Check if we are done running
                             if time.time() - self.LastImageRequestTimeSec > QuickCam.c_CaptureThreadTimeoutSec:
                                 # We are past our max time between image requests, ask the platform if we should keep running or not.
@@ -466,7 +464,6 @@ class QuickCam_RTSP:
         self.JpegStartSequence = bytearray([0xff, 0xd8, 0xff, 0xfe, 0x00, 0x10])
         self.JpegStartSequenceLen = len(self.JpegStartSequence)
         self.JpegEndSequence = bytearray([0xff, 0xd9])
-        self.PipeSelect = selectors.DefaultSelector()
         self.TimeSinceLastImg = time.time()
 
         # Std Error logic
@@ -474,8 +471,10 @@ class QuickCam_RTSP:
         self.ErrorReaderThread:threading.Thread = None
         self.ErrorReaderThreadRunning = True
 
-        self.Socket = None
-        self.Con = None
+        # Server socket logic
+        self.ServerSocket:socket.socket = None
+        self.Con:socket.socket = None
+        self.SocketPort:int = 0
 
 
     # ~~ Interface Function ~~
@@ -486,13 +485,22 @@ class QuickCam_RTSP:
         # We set the logging level of ffmpeg depending on our logging level
         # The logs are written to stderr even if they aren't errors, which is nice, so
         # we can capture them on timeouts.
-        logLevel = "trace" if self.Logger.isEnabledFor(logging.DEBUG) else "warning"
+        # TODO - anything beyond warning level tracing is too much for ffmpeg, so we only use warning for now.
+        # logLevel = "trace" if self.Logger.isEnabledFor(logging.DEBUG) else "warning"
         logLevel = "warning"
 
-        self.Socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.Socket.bind(("127.0.0.1", 0))
-        port = self.Socket.getsockname()[1]
-        self.Socket.listen()
+        # We will use a tcp socket for ffmpeg to write to, set it up now.
+        self.ServerSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.ServerSocket.bind(("127.0.0.1", 0))
+        self.SocketPort = self.ServerSocket.getsockname()[1]
+        self.ServerSocket.listen()
+        self.ServerSocket.settimeout(QuickCam_RTSP.c_ReadTimeoutSec)
+
+        # For FPS, we have found that 15 works fine for the X1 cam, but it's usually too high for other RTSP streams.
+        # We have found on a PI 4 10 FPS is a good limit. If we do higher, it pushes ffmpeg to fall behind realtime.
+        fps = 10
+        if url.find("bblp:") != -1:
+            fps = 15
 
         # For auth, if there's a username and password it will already be in the URL in the http:// basic auth style,
         # So there's nothing else we need to do.
@@ -510,18 +518,13 @@ class QuickCam_RTSP:
                     "-rtsp_transport", "0", # Use a transport as 0, which accepts either tcp or udp rtsp streams.
                     "-use_wallclock_as_timestamps", "1",
                     "-i", url,
-                    "-filter:v", "fps=10", "-q:v", "22",
+                    "-filter:v", f"fps={fps}",
                     "-movflags", "+faststart",
-                    "-f", "image2pipe", f"tcp://127.0.0.1:{port}"
-                    #"-f", "image2", "/home/pi/test/"
+                    "-f", "image2pipe", f"tcp://127.0.0.1:{self.SocketPort}"
                     ],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                stdout=None, stderr=subprocess.PIPE)
         # pylint: disable=no-member # Linux only
-        os.set_blocking(self.Process.stdout.fileno(), False)
         os.set_blocking(self.Process.stderr.fileno(), False)
-        self.PipeSelect.register(self.Process.stdout, selectors.EVENT_READ)
-
-        
 
         # Since we setup the stderr pipe, we must read from it. If it fills it's buffer it will block the ffmpeg process.
         self.ErrorReaderThread = threading.Thread(target=self._ErrorReader)
@@ -537,94 +540,90 @@ class QuickCam_RTSP:
     # To indicate connection is closed or needs to be closed, this should throw.
     def GetImage(self) -> bytearray:
         while True:
-
+            # If we haven't gotten our accepted read socket yet, do it now.
             if self.Con is None:
-                self.Con, address = self.Socket.accept()
-            
-            while True:
+                # Accept the socket and set the read timeout.
+                self.Con, _ = self.ServerSocket.accept()
+                self.Con.settimeout(QuickCam_RTSP.c_ReadTimeoutSec)
 
-                # Wait on the pipe, which will signal us when there's data to be read.
-                # We timeout after 5 seconds, which is plenty of time for the stream to be ready.
-                #self.PipeSelect.select(QuickCam_RTSP.c_ReadTimeoutSec)
+            # Read all of the data we can.
+            buffer = self.Con.recv(4096000)
 
-                # Read all of the data we can.
-                buffer = self.Con.recv(40960000)
+            # Check for a timeout. This can happen because the select timeout, or it's been too long since we got an image parsed.
+            # This usually means that ffmpeg has died or is not running correctly.
+            if self.Process.returncode is not None or (time.time() - self.TimeSinceLastImg) > QuickCam_RTSP.c_ReadTimeoutSec:
+                if self.StdErrBuffer is None or len(self.StdErrBuffer) == 0:
+                    self.StdErrBuffer = "<None>"
+                raise Exception(f"Ffmpeg read timeout. ffmpeg output:\n{self.StdErrBuffer}")
 
-                # Check for a timeout. This can happen because the select timeout, or it's been too long since we got an image parsed.
-                # This usually means that ffmpeg has died or is not running correctly.
-                if self.Process.returncode is not None or (time.time() - self.TimeSinceLastImg) > QuickCam_RTSP.c_ReadTimeoutSec:
-                    if self.StdErrBuffer is None or len(self.StdErrBuffer) == 0:
-                        self.StdErrBuffer = "<None>"
-                    raise Exception(f"Ffmpeg read timeout. ffmpeg output:\n{self.StdErrBuffer}")
+            # If we get an empty buffer, we just need to wait for more.
+            if buffer is None or len(buffer) == 0:
+                if QuickCam_RTSP.c_DebugLogging:
+                    self.Logger.debug("RTSP read empty buffer from stdin.")
+                continue
 
-                # If we get an empty buffer, we just need to wait for more.
-                if buffer is None or len(buffer) == 0:
-                    if QuickCam_RTSP.c_DebugLogging:
-                        self.Logger.debug("RTSP read empty buffer from stdin.")
-                    continue
-
-                # If there's no pending buffered data do a quick exit if we were able to read the entire buffer in our first read.
-                # If the full buffer is only one jpeg images, we don't need to do any scanning and can just return it.
-                if self.Buffer is None:
-                    if self._CheckIfFullJpeg(buffer):
-                        self._ResetLocalBuffer(True)
-                        if QuickCam_RTSP.c_DebugLogging:
-                            self.Logger.debug("RTSP fast path image received.")
-                        return buffer
-
-                # Append this buffer to the current pending buffer.
-                if self.Buffer is None:
-                    self.Buffer = buffer
-                else:
-                    self.Buffer += buffer
-
-                # Ensure the buffer is long enough to check.
-                buffLen = len(self.Buffer)
-                if buffLen <= self.JpegStartSequenceLen:
-                    continue
-
-                # Check if the buffer is a full image now
-                if self._CheckIfFullJpeg(self.Buffer):
-                    img = self.Buffer
+            # If there's no pending buffered data do a quick exit if we were able to read the entire buffer in our first read.
+            # If the full buffer is only one jpeg images, we don't need to do any scanning and can just return it.
+            if self.Buffer is None:
+                if self._CheckIfFullJpeg(buffer):
                     self._ResetLocalBuffer(True)
                     if QuickCam_RTSP.c_DebugLogging:
-                        self.Logger.debug("RTSP second quick path image received.")
-                    return img
+                        self.Logger.debug("RTSP fast path image received.")
+                    return buffer
 
-                # Scan the buffer for the jpeg end sequence.
-                newImageStart = -1
-                while self.SearchedIndex < buffLen - self.JpegStartSequenceLen:
-                    if self.Buffer[self.SearchedIndex] == self.JpegEndSequence[0] and self.Buffer[self.SearchedIndex+1] == self.JpegEndSequence[1]:
-                        newImageStart = self.SearchedIndex + 2
-                        break
-                    self.SearchedIndex += 1
+            # Append this buffer to the current pending buffer.
+            if self.Buffer is None:
+                self.Buffer = buffer
+            else:
+                self.Buffer += buffer
 
-                # See if we found a complete image.
-                if newImageStart != -1:
-                    # Get the image and check it's a full image.
-                    imgBuffer = self.Buffer[:newImageStart]
-                    if self._CheckIfFullJpeg(imgBuffer) is False:
-                        # If we don't have a correct buffer, we got off in out counting.
-                        # So reset the buffer and continue. Note after we reset the buffer, we might
-                        # hit this, since we could have a partial image in the Buffer
-                        self._ResetLocalBuffer()
-                        if QuickCam_RTSP.c_DebugLogging:
-                            self.Logger.debug("RTSP we found a jpeg end sequence, but the buffer didn't start with a jpeg start sequence.")
-                        continue
-                    # Take the image off the buffer.
-                    self.Buffer = self.Buffer[newImageStart:]
-                    self.SearchedIndex = 0
-                    self.TimeSinceLastImg = time.time()
-                    # Ensure the buffer isn't too long.
-                    self._ResetLocalBufferIfOverLimit()
-                    if QuickCam_RTSP.c_DebugLogging:
-                        self.Logger.debug("RTSP slow path image received.")
-                    return imgBuffer
+            # Ensure the buffer is long enough to check.
+            buffLen = len(self.Buffer)
+            if buffLen <= self.JpegStartSequenceLen:
+                continue
 
-                # If we didn't find anything, check the limit.
+            # Check if the buffer is a full image now
+            if self._CheckIfFullJpeg(self.Buffer):
+                img = self.Buffer
+                self._ResetLocalBuffer(True)
                 if QuickCam_RTSP.c_DebugLogging:
-                    self.Logger.debug("We got a new buffer with no image match.")
+                    self.Logger.debug("RTSP second quick path image received.")
+                return img
+
+            # Scan the buffer for the jpeg end sequence.
+            newImageStart = -1
+            while self.SearchedIndex < buffLen - self.JpegStartSequenceLen:
+                if self.Buffer[self.SearchedIndex] == self.JpegEndSequence[0] and self.Buffer[self.SearchedIndex+1] == self.JpegEndSequence[1]:
+                    newImageStart = self.SearchedIndex + 2
+                    break
+                self.SearchedIndex += 1
+
+            # See if we found a complete image.
+            if newImageStart != -1:
+                # Get the image and check it's a full image.
+                imgBuffer = self.Buffer[:newImageStart]
+                if self._CheckIfFullJpeg(imgBuffer) is False:
+                    # If we don't have a correct buffer, we got off in out counting.
+                    # So reset the buffer and continue. Note after we reset the buffer, we might
+                    # hit this, since we could have a partial image in the Buffer
+                    self._ResetLocalBuffer()
+                    if QuickCam_RTSP.c_DebugLogging:
+                        self.Logger.debug("RTSP we found a jpeg end sequence, but the buffer didn't start with a jpeg start sequence.")
+                    continue
+                # Take the image off the buffer.
+                self.Buffer = self.Buffer[newImageStart:]
+                self.SearchedIndex = 0
+                self.TimeSinceLastImg = time.time()
+                # Ensure the buffer isn't too long.
                 self._ResetLocalBufferIfOverLimit()
+                if QuickCam_RTSP.c_DebugLogging:
+                    self.Logger.debug("RTSP slow path image received.")
+                return imgBuffer
+
+            # If we didn't find anything, check the limit.
+            if QuickCam_RTSP.c_DebugLogging:
+                self.Logger.debug("We got a new buffer with no image match.")
+            self._ResetLocalBufferIfOverLimit()
 
 
     def _ResetLocalBufferIfOverLimit(self):
