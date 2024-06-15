@@ -1,9 +1,10 @@
 name: Publish Docker image
 
 # Only make and deploy new docker images on tagged releases.
-on:
-  release:
-    types: [published]
+# on:
+#   release:
+#     types: [published]
+on: [push]
 
 jobs:
   push_to_registry:
@@ -53,7 +54,7 @@ jobs:
           # These are the platform our ubuntu image base supports
           platforms: linux/amd64,linux/arm/v7,linux/arm64
           file: ./Dockerfile
-          push: true
+          push: false # TODO
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
