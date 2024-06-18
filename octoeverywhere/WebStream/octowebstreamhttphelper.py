@@ -1,7 +1,6 @@
 # namespace: WebStream
 
 import time
-import zlib
 import logging
 
 import requests
@@ -13,6 +12,7 @@ from ..octohttprequest import OctoHttpRequest
 from ..octostreammsgbuilder import OctoStreamMsgBuilder
 from ..Webcam.webcamhelper import WebcamHelper
 from ..commandhandler import CommandHandler
+from ..compression import Compression, CompressionContext
 from ..sentry import Sentry
 from ..compat import Compat
 from ..Proto import HttpHeader
@@ -40,10 +40,12 @@ class OctoWebStreamHttpHelper:
         self.WebStreamOpenMsg = webStreamOpenMsg
         self.IsClosed = False
         self.OpenedTime = openedTime
+        self.CompressionContext = CompressionContext(self.Logger)
 
         # Vars for response reading
         self.BodyReadTempBuffer = None
         self.ChunkedBodyHasNoContentLengthHeaders = False
+        self.CompressionType:DataCompression.DataCompression = None
         self.CompressionTimeSec = -1
         self.MissingBoundaryWarningCounter = 0
         self.IsUsingFullBodyBuffer = False
@@ -88,7 +90,7 @@ class OctoWebStreamHttpHelper:
     # Called when a new message has arrived for this stream from the server.
     # This function should throw on critical errors, that will reset the connection.
     # Returning true will case the websocket to close on return.
-    def IncomingServerMessage(self, webStreamMsg):
+    def IncomingServerMessage(self, webStreamMsg:WebStreamMsg.WebStreamMsg):
 
         # Note this is called on a single thread and will always handle messages
         # in order as they were sent.
@@ -105,9 +107,10 @@ class OctoWebStreamHttpHelper:
             # If we didn't know the upload size, we need to finalize it now
             self.finalizeUnknownUploadSizeIfNeeded()
 
-            # Do the request. This will block this thread until it's done and the
-            # entire response is sent.
-            self.executeHttpRequest()
+            # Do the request. This will block this thread until it's done and the entire response is sent.
+            # We want to make sure we destroy the compression context after this returns, no matter what.
+            with self.CompressionContext:
+                self.executeHttpRequest()
 
             # Return true since this stream is now done
             return True
@@ -233,7 +236,7 @@ class OctoWebStreamHttpHelper:
                 # The FULL buffer size must be set in the content-length, not the compressed size, since the compression is just for our link, it's decompressed when the
                 # message is unpacked.
                 fullContentBufferSize = len(octoHttpResult.FullBodyBuffer)
-                if octoHttpResult.IsBodyBufferZlibCompressed:
+                if octoHttpResult.BodyBufferCompressionType != DataCompression.DataCompression.None_:
                     fullContentBufferSize = octoHttpResult.BodyBufferPreCompressSize
 
                 # See what the current header is (if there is one). If it's set, it should match.
@@ -290,6 +293,10 @@ class OctoWebStreamHttpHelper:
             # general rule of thumb is that compression is quite cheap but really helps with text, so we should compress when we
             # can.
             compressBody = self.shouldCompressBody(contentTypeLower, octoHttpResult, contentLength)
+
+            # If the content length is known, tell the compression system, which will help performance.
+            if contentLength is not None:
+                self.CompressionContext.SetTotalCompressedSizeOfData(contentLength)
 
             # Since streams with unknown content-lengths can run for a while, report now when we start one.
             # If the status code is 304 or 204, we don't expect content.
@@ -405,7 +412,9 @@ class OctoWebStreamHttpHelper:
                     WebStreamMsg.AddFullStreamDataSize(builder, contentLength)
                 if compressBody:
                     # If we are compressing, we need to add what we are using and what the original size was.
-                    WebStreamMsg.AddDataCompression(builder, DataCompression.DataCompression.Zlib)
+                    if self.CompressionType is None:
+                        raise Exception("The body of this message should be compressed but not compression type is set.")
+                    WebStreamMsg.AddDataCompression(builder, self.CompressionType)
                     WebStreamMsg.AddOriginalDataSize(builder, nonCompressedBodyReadSize)
                 if isLastMessage:
                     # If this is the last message because we know the body is all
@@ -511,7 +520,7 @@ class OctoWebStreamHttpHelper:
             self.UploadBuffer = self.UploadBuffer[0:self.UploadBytesReceivedSoFar]
 
 
-    def copyUploadDataFromMsg(self, webStreamMsg):
+    def copyUploadDataFromMsg(self, webStreamMsg:WebStreamMsg.WebStreamMsg):
         # Check how much data this message has in it.
         # This size is the size of the full buffer, which is decompressed size if the data is compressed.
         thisMessageDataLen = webStreamMsg.DataLength()
@@ -578,13 +587,13 @@ class OctoWebStreamHttpHelper:
 
 
     # A helper, given a web stream message returns it's data buffer, decompressed if needed.
-    def decompressBufferIfNeeded(self, webStreamMsg):
-        if webStreamMsg.DataCompression() == DataCompression.DataCompression.Brotli:
-            raise Exception("decompressBufferIfNeeded Failed - Brotli decompression not possible.")
-        elif webStreamMsg.DataCompression() == DataCompression.DataCompression.Zlib:
-            return zlib.decompress(webStreamMsg.DataAsByteArray())
-        else:
+    def decompressBufferIfNeeded(self, webStreamMsg:WebStreamMsg.WebStreamMsg):
+        # Get the compression type.
+        compressionType = webStreamMsg.DataCompression()
+        if compressionType is DataCompression.DataCompression.None_:
             return webStreamMsg.DataAsByteArray()
+        # It's compressed, decompress it.
+        return Compression.Get().Decompress(self.CompressionContext, webStreamMsg.DataAsByteArray(), webStreamMsg.OriginalDataSize(), webStreamMsg.IsDataTransmissionDone(), compressionType)
 
 
     def checkForNotModifiedCacheAndUpdateResponseIfSo(self, sentHeaders, octoHttpResult:OctoHttpRequest.Result):
@@ -647,13 +656,18 @@ class OctoWebStreamHttpHelper:
 
     # Based on the content-type header, this determines if we would apply compression or not.
     # Returns true or false
-    def shouldCompressBody(self, contentTypeLower, octoHttpResult, contentLengthOpt):
+    def shouldCompressBody(self, contentTypeLower:str, octoHttpResult:OctoHttpRequest.Result, contentLengthOpt:int):
         # Compression isn't too expensive in terms of cpu cost but for text, it drastically
         # cuts the size down (ike a 75% reduction.) So we are quite liberal with our compression.
 
-        # From testing, we have found that compressing anything smaller than ~200 bytes has not effect
-        # thus it's not worth doing (it actually makes it slightly larger)
-        if contentLengthOpt is not None and contentLengthOpt < 200:
+        # If there is a full body buffer and and it's already compressed, always return true.
+        # This ensures the message is flagged correctly for compression and the body reading system
+        # will also read the flag and skip the compression.
+        if octoHttpResult.BodyBufferCompressionType != DataCompression.DataCompression.None_:
+            return True
+
+        # Make sure we have a known length and it's not too small to compress.
+        if contentLengthOpt is not None and contentLengthOpt < Compression.MinSizeToCompress:
             return False
 
         # If we don't know what this is, we don't want to compress it.
@@ -662,21 +676,16 @@ class OctoWebStreamHttpHelper:
         if contentTypeLower is None:
             return False
 
-        # If there is a full body buffer and and it's already compressed, always return true.
-        # This ensures the message is flagged correctly for compression and the body reading system
-        # will also read the flag and skip the compression.
-        if octoHttpResult.IsBodyBufferZlibCompressed:
-            return True
-
         # We will compress...
         #   - Any thing that has text/ in it
         #   - Anything that says it's javascript
         #   - Anything that says it's json
         #   - Anything that's xml
         #   - Anything that's svg
+        #   - Anything that's a application/octet-stream - moonraker sends unknown file types as these.
         return (contentTypeLower.find("text/") != -1 or contentTypeLower.find("javascript") != -1
                 or contentTypeLower.find("json") != -1 or contentTypeLower.find("xml") != -1
-                or contentTypeLower.find("svg") != -1)
+                or contentTypeLower.find("svg") != -1 or contentTypeLower.find("application/octet-stream") != -1)
 
 
     # Reads data from the response body, puts it in a data vector, and returns the offset.
@@ -686,14 +695,25 @@ class OctoWebStreamHttpHelper:
         # This is the max size each body read will be. Since we are making local calls, most of the time we will always get this full amount as long as theres more body to read.
         # This size is a little under the max read buffer on the server, allowing the server to handle the buffers with no copies.
         #
-        # 3/24/24 - We did a lot of direct download testing to tweak this buffer size and the server read size, these were the best values able to hit about 223mpbs.
+        # 3/24/24 - We did a lot of direct download testing to tweak this buffer size and the server read size, these were the best values able to hit about 223mbps.
         # With the current values, the majority of the time is spent sending the data on the websocket.
+        #
+        # But NOTE! This size is the actual size that will be allocated for the read buffer (in the stream class) and then the buffer is sliced by how much
+        # is read. So we can't make this value too large, or we will be allocating big buffers.
+        # This is 490kb
         defaultBodyReadSizeBytes = 490 * 1024
 
         # If we are going to compress this read, use a much higher number. Since most of what we compress is text,
         # and that text usually compresses down to 25% of the og size, we will use a x4 multiplier.
+        # We do want to make sure this value isn't too big, because we dont want to allocate a huge buffer on low memory systems.
         if shouldCompress:
             defaultBodyReadSizeBytes = defaultBodyReadSizeBytes * 4
+
+        # Finally check if we know the content length of the request. If we do, we will set the buffer to be exactly that value.
+        # This is a lot more efficient, because we only allocate a buffer the exact size we need for the request.
+        # But we want to limit the max size of the buffer, so we don't allocate a huge buffer for a large request.
+        if contentLength_NoneIfNotKnown is not None and contentLength_NoneIfNotKnown < defaultBodyReadSizeBytes:
+            defaultBodyReadSizeBytes = contentLength_NoneIfNotKnown
 
         # Some requests like snapshot requests will already have a fully read body. In this case we use the existing body buffer instead of reading from the body.
         finalDataBuffer = None
@@ -737,7 +757,7 @@ class OctoWebStreamHttpHelper:
                             defaultBodyReadSizeBytes = contentLength_NoneIfNotKnown
                         else:
                             # Use a 2mb buffer.
-                            defaultBodyReadSizeBytes = 1024 * 1024 * 1024 * 2
+                            defaultBodyReadSizeBytes = 1024 * 1024 * 2
                     finalDataBuffer = self.doBodyRead(octoHttpResult, defaultBodyReadSizeBytes)
 
         # Keep track of read times.
@@ -760,76 +780,32 @@ class OctoWebStreamHttpHelper:
                 # If we have the compat handler, give it the buffer before we finalize the size, as it might want to edit the buffer.
                 if Compat.HasWebRequestResponseHandler():
                     finalDataBuffer = Compat.GetWebRequestResponseHandler().HandleResponse(responseHandlerContext, octoHttpResult, finalDataBuffer)
+                # Important! If the response handler has edited the buffer, we need to update the content length to match the new size.
+                # This is safe to do because currently we always read the entire buffer for a responseHandlerContext into one buffer, thus there's only one read, and this is the read.
+                # The function that calls readContentFromBodyAndMakeDataVector will correct the content header length in the main class, but we must update the encryption context
+                # otherwise the zstandard lib encryption will fail.
+                self.CompressionContext.SetTotalCompressedSizeOfData(len(finalDataBuffer))
 
         # If we were asked to compress, do it
         originalBufferSize = len(finalDataBuffer)
 
         # Check to see if this was a full body buffer, if it was already compressed.
-        if octoHttpResult.IsBodyBufferZlibCompressed:
-            # If so, use pre compress size it's supplies.
-            # And skip compression since it's already done.
+        if octoHttpResult.BodyBufferCompressionType != DataCompression.DataCompression.None_:
+            # The full body buffer was already compressed and set, so update the other compression values.
             originalBufferSize = octoHttpResult.BodyBufferPreCompressSize
+            if self.CompressionType is not None:
+                raise Exception(f"The BodyBufferCompressionType tried to be set but the compression was already set.! It is {self.CompressionType} and now tried to be {octoHttpResult.BodyBufferCompressionType}")
+            self.CompressionType = octoHttpResult.BodyBufferCompressionType
+
         # Otherwise, check if we should compress
         elif shouldCompress:
-            # Some setups can't install brotli since it requires gcc and c++ to compile native code.
-            # zlib is part of PY so all plugins us it. Right now it's not worth the tradeoff from testing to enable brotli.
-            #
-            # After a good amount of testing, we found that a compression level of 3 is a good tradeoff for both.
-            # For small to medium size files zlib can actually be better. Brotli starts to be much better in terms of speed
-            # and compression for larger files. But for now given the file sizes we use here, it's not worth it.
-            #
-            # Here's a good quick benchmark on a large js file (4mb)
-            #2021-12-17 22:37:22,258 - octoprint.plugins.octoeverywhere - INFO - zlib level: 0 time:9.43207740784 size: 815175 og:815104
-            #2021-12-17 22:37:22,319 - octoprint.plugins.octoeverywhere - INFO - zlib level: 1 time:58.7220191956 size: 273923 og:815104
-            #2021-12-17 22:37:22,383 - octoprint.plugins.octoeverywhere - INFO - zlib level: 2 time:61.7210865021 size: 263366 og:815104
-            #2021-12-17 22:37:22,453 - octoprint.plugins.octoeverywhere - INFO - zlib level: 3 time:69.3519115448 size: 256257 og:815104
-            #2021-12-17 22:37:22,537 - octoprint.plugins.octoeverywhere - INFO - zlib level: 4 time:81.6609859467 size: 239928 og:815104
-            #2021-12-17 22:37:22,650 - octoprint.plugins.octoeverywhere - INFO - zlib level: 5 time:110.955953598 size: 231844 og:815104
-            #2021-12-17 22:37:22,803 - octoprint.plugins.octoeverywhere - INFO - zlib level: 6 time:150.192022324 size: 229684 og:815104
-            #2021-12-17 22:37:22,972 - octoprint.plugins.octoeverywhere - INFO - zlib level: 7 time:166.711091995 size: 229118 og:815104
-            #2021-12-17 22:37:23,196 - octoprint.plugins.octoeverywhere - INFO - zlib level: 8 time:221.390962601 size: 228784 og:815104
-            #2021-12-17 22:37:23,442 - octoprint.plugins.octoeverywhere - INFO - zlib level: 9 time:244.188070297 size: 228737 og:815104
-            #2021-12-17 22:37:23,477 - octoprint.plugins.octoeverywhere - INFO - brotli level: 0 time:31.9409370422 size: 280540 og:815104
-            #2021-12-17 22:37:23,536 - octoprint.plugins.octoeverywhere - INFO - brotli level: 1 time:56.2720298767 size: 267581 og:815104
-            #2021-12-17 22:37:23,611 - octoprint.plugins.octoeverywhere - INFO - brotli level: 2 time:72.9219913483 size: 245109 og:815104
-            #2021-12-17 22:37:23,703 - octoprint.plugins.octoeverywhere - INFO - brotli level: 3 time:86.4551067352 size: 241472 og:815104
-            #2021-12-17 22:37:23,874 - octoprint.plugins.octoeverywhere - INFO - brotli level: 4 time:169.479846954 size: 235446 og:815104
-            #2021-12-17 22:37:24,125 - octoprint.plugins.octoeverywhere - INFO - brotli level: 5 time:248.244047165 size: 219928 og:815104
-            #2021-12-17 22:37:24,451 - octoprint.plugins.octoeverywhere - INFO - brotli level: 6 time:321.651935577 size: 217598 og:815104
-            #2021-12-17 22:37:24,848 - octoprint.plugins.octoeverywhere - INFO - brotli level: 7 time:395.76292038 size: 216307 og:815104
-            #2021-12-17 22:37:25,334 - octoprint.plugins.octoeverywhere - INFO - brotli level: 8 time:483.689785004 size: 215660 og:815104
-            #2021-12-17 22:37:25,973 - octoprint.plugins.octoeverywhere - INFO - brotli level: 9 time:637.011051178 size: 214962 og:815104
-            #2021-12-17 22:37:30,395 - octoprint.plugins.octoeverywhere - INFO - brotli level: 10 time:4420.00603676 size: 202474 og:815104
-            #2021-12-17 22:37:40,826 - octoprint.plugins.octoeverywhere - INFO - brotli level: 11 time:10429.7590256 size: 198538 og:815104
-            # Here's a more average size file
-            #2021-12-17 22:45:06,278 - octoprint.plugins.octoeverywhere - INFO - zlib level: 0 time:1.84893608093 size: 13514 og:13503
-            #2021-12-17 22:45:06,291 - octoprint.plugins.octoeverywhere - INFO - zlib level: 1 time:1.37400627136 size: 5647 og:13503
-            #2021-12-17 22:45:06,298 - octoprint.plugins.octoeverywhere - INFO - zlib level: 2 time:3.87191772461 size: 5550 og:13503
-            #2021-12-17 22:45:06,301 - octoprint.plugins.octoeverywhere - INFO - zlib level: 3 time:1.43599510193 size: 5498 og:13503
-            #2021-12-17 22:45:06,304 - octoprint.plugins.octoeverywhere - INFO - zlib level: 4 time:1.70516967773 size: 5306 og:13503
-            #2021-12-17 22:45:06,308 - octoprint.plugins.octoeverywhere - INFO - zlib level: 5 time:2.17819213867 size: 5227 og:13503
-            #2021-12-17 22:45:06,312 - octoprint.plugins.octoeverywhere - INFO - zlib level: 6 time:2.08187103271 size: 5217 og:13503
-            #2021-12-17 22:45:06,316 - octoprint.plugins.octoeverywhere - INFO - zlib level: 7 time:2.29096412659 size: 5218 og:13503
-            #2021-12-17 22:45:06,320 - octoprint.plugins.octoeverywhere - INFO - zlib level: 8 time:2.12597846985 size: 5218 og:13503
-            #2021-12-17 22:45:06,324 - octoprint.plugins.octoeverywhere - INFO - zlib level: 9 time:2.29811668396 size: 5218 og:13503
-            #2021-12-17 22:45:06,327 - octoprint.plugins.octoeverywhere - INFO - brotli level: 0 time:1.26886367798 size: 5877 og:13503
-            #2021-12-17 22:45:06,330 - octoprint.plugins.octoeverywhere - INFO - brotli level: 1 time:1.18708610535 size: 5828 og:13503
-            #2021-12-17 22:45:06,334 - octoprint.plugins.octoeverywhere - INFO - brotli level: 2 time:1.77407264709 size: 5479 og:13503
-            #2021-12-17 22:45:06,339 - octoprint.plugins.octoeverywhere - INFO - brotli level: 3 time:2.63094902039 size: 5418 og:13503
-            #2021-12-17 22:45:06,345 - octoprint.plugins.octoeverywhere - INFO - brotli level: 4 time:4.88996505737 size: 5335 og:13503
-            #2021-12-17 22:45:06,354 - octoprint.plugins.octoeverywhere - INFO - brotli level: 5 time:6.34503364563 size: 5007 og:13503
-            #2021-12-17 22:45:06,364 - octoprint.plugins.octoeverywhere - INFO - brotli level: 6 time:8.3749294281 size: 5003 og:13503
-            #2021-12-17 22:45:06,384 - octoprint.plugins.octoeverywhere - INFO - brotli level: 7 time:18.7141895294 size: 4994 og:13503
-            #2021-12-17 22:45:06,411 - octoprint.plugins.octoeverywhere - INFO - brotli level: 8 time:25.6741046906 size: 4994 og:13503
-            #2021-12-17 22:45:06,447 - octoprint.plugins.octoeverywhere - INFO - brotli level: 9 time:33.3149433136 size: 4989 og:13503
-            #2021-12-17 22:45:06,499 - octoprint.plugins.octoeverywhere - INFO - brotli level: 10 time:50.5220890045 size: 4609 og:13503
-            #2021-12-17 22:45:06,636 - octoprint.plugins.octoeverywhere - INFO - brotli level: 11 time:135.287046432 size: 4503 og:13503
-
-            start = time.time()
-            finalDataBuffer = zlib.compress(finalDataBuffer, 3)
-            if self.CompressionTimeSec == -1:
-                self.CompressionTimeSec = 0
-            self.CompressionTimeSec += (time.time() - start)
+            compressionResult = Compression.Get().Compress(self.CompressionContext, finalDataBuffer)
+            finalDataBuffer = compressionResult.Bytes
+            self.CompressionTimeSec += compressionResult.CompressionTimeSec
+            if self.CompressionType is None:
+                self.CompressionType = compressionResult.CompressionType
+            elif self.CompressionType != compressionResult.CompressionType:
+                raise Exception(f"The data compression has changed mid stream! It was {self.CompressionType} and now tried to be {compressionResult.CompressionType}")
 
         # We have a data buffer, so write it into the builder and return the offset.
         return (originalBufferSize, len(finalDataBuffer), builder.CreateByteVector(finalDataBuffer))
@@ -989,7 +965,7 @@ class OctoWebStreamHttpHelper:
         return tempBufferFilledSize
 
 
-    def doBodyRead(self, octoHttpResult:OctoHttpRequest.Result, readSize):
+    def doBodyRead(self, octoHttpResult:OctoHttpRequest.Result, readSize:int):
         try:
             # Ensure there's an actual requests lib Response object to read from
             response = octoHttpResult.ResponseForBodyRead
@@ -1002,6 +978,10 @@ class OctoWebStreamHttpHelper:
             #
             # Thus in our case, we want to just read the response raw. This is what the chunk logic does under the hood anyways, so this path
             # is more direct and should be more efficient.
+            #
+            # Note, whatever size we pass in will be allocated as a buffer, filled, and then sliced.
+            # So if we pass in a huge value, we will get a big buffer allocated.
+            # So if we know the size, we should use it, so that the buffer allocated it the same amount that's returned.
             data = response.raw.read(readSize)
 
             # If we got a data buffer return it.
