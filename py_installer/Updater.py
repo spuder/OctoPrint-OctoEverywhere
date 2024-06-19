@@ -11,6 +11,7 @@ from .Paths import Paths
 from .Service import Service
 from .Util import Util
 from .Ffmpeg import Ffmpeg
+from .ZStandard import ZStandard
 
 #
 # This class is responsible for doing updates for all local, companions, and bambu connect plugins on this local system.
@@ -47,6 +48,9 @@ class Updater:
 
         # On any system, try to install or update ffmpeg.
         Ffmpeg.TryToInstallFfmpeg(context)
+
+        # We also want to try to install or update the optional zstandard lib for compression.
+        ZStandard.TryToInstallZStandard(context)
 
         Logger.Info("We found the following plugins to update:")
         for s in foundOeServices:

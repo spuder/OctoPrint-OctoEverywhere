@@ -226,7 +226,9 @@ class Compression:
     # Since zstandard can't be a required dep since it will fail on some platforms, we try to install it via the runtime or
     # the linux installer if possible. Due to that, this is the package version string they will use ty to to install it.
     # We currently have this set to 21, which still supports PY3.7, which is from 2019.
+    # THIS MUST STAY IN SYNC WITH THE VERSION IN THE Dockerfile
     ZStandardPipPackageString = "zstandard>=0.21.0,<0.23.0"
+    ZStandardMinCoreCountForInstall = 3
 
     _Instance = None
 
@@ -295,7 +297,7 @@ class Compression:
         # If we can't use zstandard, we assume it's not installed since it doesn't install as a required dependency.
         # In that case, we will use this function to try to install it async, and it will be used on the next restart.
         # But, if the system has two or less cores, dont try to install, because it's probably not powerful enough to use it.
-        if self.CanUseZStandardLib is False and cpuCores > 2:
+        if self.CanUseZStandardLib is False and cpuCores >= Compression.ZStandardMinCoreCountForInstall:
             self._TryInstallZStandardIfNeededAsync()
 
 

@@ -14,6 +14,7 @@ from .TimeSync import TimeSync
 from .Frontend import Frontend
 from .Uninstall import Uninstall
 from .Ffmpeg import Ffmpeg
+from .ZStandard import ZStandard
 
 class Installer:
 
@@ -143,6 +144,9 @@ class Installer:
         # We need ffmpeg for the Bambu Connect X1 streaming or any user who wants to use a RTSP camera.
         # Installing ffmpeg is best effort and not required for the plugin to work.
         Ffmpeg.TryToInstallFfmpeg(context)
+
+        # We also want to try to install the optional zstandard lib for compression.
+        ZStandard.TryToInstallZStandard(context)
 
         # Before we start the service, check if the secrets config file already exists and if a printer id already exists.
         # This will indicate if this is a fresh install or not.
