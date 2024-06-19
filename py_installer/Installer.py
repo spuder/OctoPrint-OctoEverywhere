@@ -114,6 +114,9 @@ class Installer:
             uninstall.DoUninstall(context)
             return
 
+        # Since this runs an async thread, kick it off now so it can start working.
+        ZStandard.TryToInstallZStandardAsync(context)
+
         # Next step is to discover and fill out the moonraker config file path and service file name.
         # If we are doing an companion or bambu setup, we need the user to help us input the details to the external moonraker IP or bambu printer.
         # This is the hardest part of the setup, because it's highly dependent on the system and different moonraker setups.
@@ -145,9 +148,6 @@ class Installer:
         # Installing ffmpeg is best effort and not required for the plugin to work.
         Ffmpeg.TryToInstallFfmpeg(context)
 
-        # We also want to try to install the optional zstandard lib for compression.
-        ZStandard.TryToInstallZStandard(context)
-
         # Before we start the service, check if the secrets config file already exists and if a printer id already exists.
         # This will indicate if this is a fresh install or not.
         context.ExistingPrinterId = Linker.GetPrinterIdFromServiceSecretsConfigFile(context)
@@ -157,6 +157,10 @@ class Installer:
 
         # Just before we start (or restart) the service, ensure all of the permission are set correctly
         permissions.EnsureFinalPermissions(context)
+
+        # If there was an install running, wait for it to finish now, before the service starts.
+        # For most installs, the user will take longer to add the info than it takes to install zstandard.
+        ZStandard.WaitForInstallToComplete()
 
         # We are fully configured, create the service file and it's dependent files.
         service = Service()
