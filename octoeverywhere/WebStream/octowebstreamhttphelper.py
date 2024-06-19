@@ -220,7 +220,6 @@ class OctoWebStreamHttpHelper:
             # This function will check if we want to do a 304 return and update the request correctly.
             self.checkForNotModifiedCacheAndUpdateResponseIfSo(sendHeaders, octoHttpResult)
 
-
             # Before we check the headers, check if we are using a full body buffer.
             # If we are using a full body buffer, we need to ensure the content header is set. This will do a few things:
             #   - It will make the request more efficient since we can allocate the fully know buffer size.
@@ -343,6 +342,7 @@ class OctoWebStreamHttpHelper:
                     nonCompressedBodyReadSize = 0
                     lastBodyReadLength = 0
                     dataOffset = None
+                    compressBody = False
                 else:
                     # Start by reading data from the response.
                     # This function will return a read length of 0 and a null data offset if there's nothing to read.
@@ -368,9 +368,9 @@ class OctoWebStreamHttpHelper:
                 # Validate.
                 if contentLength is not None and nonCompressedContentReadSizeBytes > contentLength:
                     self.Logger.warn(self.getLogMsgPrefix()+" the http stream read more data than the content length indicated.")
-                if dataOffset is None and contentLength is not None and nonCompressedContentReadSizeBytes < contentLength:
+                if dataOffset is not None and contentLength is not None and nonCompressedContentReadSizeBytes < contentLength:
                     # This might happen if the connection closes unexpectedly before the transfer is done.
-                    self.Logger.warn(self.getLogMsgPrefix()+" we expected a fixed length response, but the body read completed before we read it all.")
+                    self.Logger.warn(self.getLogMsgPrefix()+f" we expected a fixed length response, but the body read completed before we read it all. cl:{contentLength}, got:{nonCompressedContentReadSizeBytes} {uri}")
 
                 # Check if this is the last message.
                 # This is the last message if...
@@ -598,43 +598,65 @@ class OctoWebStreamHttpHelper:
 
     def checkForNotModifiedCacheAndUpdateResponseIfSo(self, sentHeaders, octoHttpResult:OctoHttpRequest.Result):
         # Check if the sent headers have any conditional http headers.
-        etag = None
-        modifiedDate = None
+        requestEtag = None
+        requestModifiedDate = None
         for key in sentHeaders:
             keyLower = key.lower()
             if keyLower == "if-modified-since":
-                modifiedDate = sentHeaders[key]
+                requestModifiedDate = sentHeaders[key]
             if keyLower == "if-none-match":
-                etag = sentHeaders[key]
+                requestEtag = sentHeaders[key]
+                # If the request etag starts with the weak indicator, remove it
+                if requestEtag.startswith("W/"):
+                    requestEtag = requestEtag[2:]
 
         # If there were none found, there's nothing do to.
-        if etag is None and modifiedDate is None:
+        if requestEtag is None and requestModifiedDate is None:
             return
 
         # Look through the response headers
+        responseEtag = None
+        responseModifiedDate = None
         headers = octoHttpResult.Headers
         for key in headers:
             keyLower = key.lower()
-            if etag is not None and keyLower == "etag":
-                # Both have etags, check them.
-                # If the request etag starts with the weak indicator, remove it
-                if etag.startswith("W/"):
-                    etag = etag[2:]
-                # Check for an exact match.
-                if etag == headers[key]:
-                    self.updateResponseFor304(octoHttpResult)
-                    return
-            if modifiedDate is not None and keyLower == "last-modified":
-                # There are actual ways to parse and compare these,
-                # But for now we will just do exact matches.
-                if modifiedDate == headers[key]:
-                    self.updateResponseFor304(octoHttpResult)
-                    return
+            if keyLower == "etag":
+                responseEtag = headers[key]
+            if keyLower == "last-modified":
+                responseModifiedDate = headers[key]
+            if responseEtag is not None and responseModifiedDate is not None:
+                break
+
+        # See if there are any matches.
+        # If we have both values, both must match.
+        convertTo304 = False
+        # If we have both, both must match
+        if requestEtag is not None and requestModifiedDate is not None:
+            if responseEtag is not None and responseModifiedDate is not None and requestEtag == responseEtag and requestModifiedDate == responseModifiedDate:
+                convertTo304 = True
+        # If we only have the date, see if it matches
+        elif requestModifiedDate is not None:
+            if responseModifiedDate is not None and requestModifiedDate == responseModifiedDate:
+                convertTo304 = True
+        # If we only have the etag, see if it matches
+        elif requestEtag is not None:
+            if responseEtag is not None and requestEtag == responseEtag:
+                convertTo304 = True
+
+        # Check if we have something to do.
+        if convertTo304 is False:
+            return
+
+        # Convert the response.
+        self.updateResponseFor304(octoHttpResult)
 
 
     def updateResponseFor304(self, octoHttpResult:OctoHttpRequest.Result):
+        self.Logger.info(f"Converting request for {octoHttpResult.Url} {octoHttpResult.StatusCode} to a 304.")
         # First of all, update the status code.
         octoHttpResult.StatusCode = 304
+        # Next, if this was a cached result or a result that has a full body buffer, we need to clear it.
+        octoHttpResult.ClearFullBodyBuffer()
         # Remove any headers we don't want to send. Including some of these seems to trip up some browsers.
         # However, there are some we must send...
         # Quote - Note that the server generating a 304 response MUST generate any of the following header fields that would have been sent in a 200 (OK) response to the same request: Cache-Control, Content-Location, Date, ETag, Expires, and Vary.
@@ -794,14 +816,18 @@ class OctoWebStreamHttpHelper:
             # The full body buffer was already compressed and set, so update the other compression values.
             originalBufferSize = octoHttpResult.BodyBufferPreCompressSize
             if self.CompressionType is not None:
-                raise Exception(f"The BodyBufferCompressionType tried to be set but the compression was already set.! It is {self.CompressionType} and now tried to be {octoHttpResult.BodyBufferCompressionType}")
+                raise Exception(f"The BodyBufferCompressionType tried to be set but the compression was already set! It is {self.CompressionType} and now tried to be {octoHttpResult.BodyBufferCompressionType}")
             self.CompressionType = octoHttpResult.BodyBufferCompressionType
 
         # Otherwise, check if we should compress
         elif shouldCompress:
             compressionResult = Compression.Get().Compress(self.CompressionContext, finalDataBuffer)
             finalDataBuffer = compressionResult.Bytes
+            # Init and update the total compression time if needed.
+            if self.CompressionTimeSec < 0:
+                self.CompressionTimeSec = 0
             self.CompressionTimeSec += compressionResult.CompressionTimeSec
+            # Set the compression type, this should only be set once and can't change.
             if self.CompressionType is None:
                 self.CompressionType = compressionResult.CompressionType
             elif self.CompressionType != compressionResult.CompressionType:

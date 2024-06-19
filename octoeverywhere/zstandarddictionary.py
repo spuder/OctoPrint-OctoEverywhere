@@ -47,7 +47,8 @@ class ZStandardDictionary:
         localDict = zstd.ZstdCompressionDict(dictData, dict_type=zstd.DICT_TYPE_FULLDICT)
 
         # Doing pre-compute now makes it so we don't have to use compute the dict on first use.
-        localDict.precompute_compress()
+        # We must specify a level, so we use the same level we use elsewhere, which is the default of 3.
+        localDict.precompute_compress(level=3)
 
         # Success! We are using the pre-trained dict, so set it.
         self.PreTrainedDict = localDict

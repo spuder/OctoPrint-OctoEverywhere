@@ -122,7 +122,7 @@ class MoonrakerHost:
                 Telemetry.SetServerProtocolAndDomain("http://"+DevLocalServerAddress_CanBeNone)
 
             # Init compression
-            Compression.Init(self.Logger)
+            Compression.Init(self.Logger, localStorageDir)
 
             # Init the mdns client
             MDns.Init(self.Logger, localStorageDir)

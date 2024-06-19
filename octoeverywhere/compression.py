@@ -1,7 +1,11 @@
+import os
+import sys
+import json
 import time
 import zlib
 import logging
 import threading
+import subprocess
 import multiprocessing
 
 from .sentry import Sentry
@@ -219,11 +223,16 @@ class Compression:
     # That said, zstandard actually does quite well with small payloads, so we can set this quite low.
     MinSizeToCompress = 200
 
+    # Since zstandard can't be a required dep since it will fail on some platforms, we try to install it via the runtime or
+    # the linux installer if possible. Due to that, this is the package version string they will use ty to to install it.
+    # We currently have this set to 21, which still supports PY3.7, which is from 2019.
+    ZStandardPipPackageString = "zstandard>=0.21.0,<0.23.0"
+
     _Instance = None
 
     @staticmethod
-    def Init(logger: logging.Logger):
-        Compression._Instance = Compression(logger)
+    def Init(logger: logging.Logger, localFileStoragePath:str):
+        Compression._Instance = Compression(logger, localFileStoragePath)
 
 
     @staticmethod
@@ -231,8 +240,9 @@ class Compression:
         return Compression._Instance
 
 
-    def __init__(self, logger: logging.Logger) -> None:
+    def __init__(self, logger: logging.Logger, localFileStoragePath:str) -> None:
         self.Logger = logger
+        self.LocalFileStoragePath = localFileStoragePath
         self.ZStandardCompressorPool = []
         self.ZStandardCompressorPoolLock = threading.Lock()
         self.ZStandardCompressorCreatedCount = 0
@@ -245,11 +255,11 @@ class Compression:
         # If there are 3 or less cores, we will only use one thread.
         # If there are 4 or more cores, we will use all but 2.
         self.ZStandardThreadCount = 1
-        cores = multiprocessing.cpu_count()
-        if cores <= 3:
+        cpuCores = multiprocessing.cpu_count()
+        if cpuCores <= 3:
             self.ZStandardThreadCount = 1
         else:
-            self.ZStandardThreadCount = cores - 2
+            self.ZStandardThreadCount = cpuCores - 2
 
         # Always init the zstandard singleton, even if we aren't using zstandard.
         ZStandardDictionary.Init(logger)
@@ -260,7 +270,6 @@ class Compression:
         try:
             #pylint: disable=import-outside-toplevel,unused-import
             import zstandard as zstd
-            self.Logger.info(f"Compression is using zstandard with {self.ZStandardThreadCount} threads")
 
             # Since we are using zlib, try to load the pre-trained dictionary.
             # This will throw if it fails, and we must load this dict to use zstandard, because the server expects it.
@@ -268,6 +277,7 @@ class Compression:
 
             # Only set this flag after everything is setup and good.
             self.CanUseZStandardLib = True
+            self.Logger.info(f"Compression is using zstandard with {self.ZStandardThreadCount} threads")
 
             # Once the state is set, make a few compressors and decompressors so they are cached and ready to go.
             c = self.RentZStandardCompressor()
@@ -281,6 +291,12 @@ class Compression:
             self.ReturnZStandardDecompressor(d2)
         except Exception as e:
             self.Logger.info(f"Failed to load the zstandard lib, so we won't use it. Error: {e}")
+
+        # If we can't use zstandard, we assume it's not installed since it doesn't install as a required dependency.
+        # In that case, we will use this function to try to install it async, and it will be used on the next restart.
+        # But, if the system has two or less cores, dont try to install, because it's probably not powerful enough to use it.
+        if self.CanUseZStandardLib is False and cpuCores > 2:
+            self._TryInstallZStandardIfNeededAsync()
 
 
     # Given a buffer of data, compress it using the best available compression library.
@@ -376,6 +392,45 @@ class Compression:
             return
         with self.ZStandardDecompressorPoolLock:
             self.ZStandardDecompressorPool.append(decompressor)
+
+
+    # If we can't use zstandard, we assume it's not installed since it doesn't install as a required dependency.
+    # In that case, we will use this function to try to install it async, and it will be used on the next restart.
+    def _TryInstallZStandardIfNeededAsync(self):
+        threading.Thread(target=self._TryInstallZStandardIfNeeded, daemon=True).start()
+
+
+    def _TryInstallZStandardIfNeeded(self):
+        lastAttemptFileName = "CompressionData.json"
+        try:
+            # First, see if we need to try to do this again.
+            filePath = os.path.join(self.LocalFileStoragePath, lastAttemptFileName)
+            if os.path.exists(filePath):
+                with open(filePath, encoding="utf-8") as f:
+                    data = json.load(f)
+                    if "LastUpdateTimeSec" in data:
+                        lastUpdateTimeSec = float(data["LastUpdateTimeSec"])
+                        # If the most recent attempt was less than 30 days ago, we won't try again.
+                        if time.time() - lastUpdateTimeSec < 30 * 24 * 60 * 60:
+                            return
+
+            # We are going to update, write a file now with the current time.
+            with open(filePath, encoding="utf-8", mode="w") as f:
+                data = {
+                    "LastUpdateTimeSec": time.time()
+                }
+                json.dump(data, f)
+
+            # Try to do the update now.
+            # Limit the install, but give it a longer timeout since it might try to compile.
+            # Use `sys.executable` to make sure we get our virtual env python.
+            result = subprocess.run([sys.executable, '-m', 'pip', 'install', Compression.ZStandardPipPackageString], timeout=60.0, check=False, capture_output=True)
+            if result.returncode == 0:
+                self.Logger.info(f"Pip install/update of {sys.executable} {Compression.ZStandardPipPackageString} successful.")
+                return
+            self.Logger.info(f"Compression pip install failed. {sys.executable} {Compression.ZStandardPipPackageString}. stdout:{result.stdout} - stderr:{result.stderr}")
+        except Exception as e:
+            self.Logger.error(f"Compression failed to pip install zstandard lib. {e}")
 
 #
 # This is an old comment, from before zstandard lib. But it still has useful info about zlib and brotli

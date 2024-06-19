@@ -171,7 +171,7 @@ if __name__ == '__main__':
         Telemetry.SetServerProtocolAndDomain("http://"+LocalServerAddress)
 
     # Setup compression
-    Compression.Init(logger)
+    Compression.Init(logger, PluginFilePathRoot)
 
     # Init the mdns client
     MDns.Init(logger, PluginFilePathRoot)

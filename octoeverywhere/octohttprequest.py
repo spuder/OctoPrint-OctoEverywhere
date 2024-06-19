@@ -140,6 +140,13 @@ class OctoHttpRequest:
             if compressionType != DataCompression.None_ and preCompressedSize <= 0:
                 raise Exception("The pre-compression full size must be set if the buffer is compressed.")
 
+        # It's important we clear all of the vars that are set above.
+        # This is used by the system that updates the request object with a 304 if the cache headers match.
+        def ClearFullBodyBuffer(self):
+            self._fullBodyBuffer = None
+            self._bodyCompressionType = DataCompression.None_
+            self._fullBodyBufferPreCompressedSize = 0
+
         # Since most things use request Stream=True, this is a helpful util that will read the entire
         # content of a request and return it. Note if the request has no defined length, this will read
         # as long as the stream will go.
